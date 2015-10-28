@@ -1,0 +1,318 @@
+/*
+ * Set up the VMAs to tell the VM about the vDSO.
+ * Copyright 2007 Andi Kleen, SUSE Labs.
+ * Subject to the GPL, v.2
+ */
+#include <linux/mm.h>
+#include <linux/err.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/init.h>
+#include <linux/random.h>
+#include <linux/elf.h>
+#include <asm/vsyscall.h>
+#include <asm/vgtod.h>
+#include <asm/proto.h>
+#include <asm/vdso.h>
+#include <asm/page.h>
+
+#include <linux/utsname.h>
+#include <linux/version.h>
+#include <linux/ve.h>
+
+unsigned int __read_mostly vdso_enabled = 1;
+
+extern char vdso_start[], vdso_end[];
+extern unsigned short vdso_sync_cpuid;
+
+extern struct page *vdso_pages[];
+static unsigned vdso_size;
+
+#ifdef CONFIG_X86_X32_ABI
+extern char vdsox32_start[], vdsox32_end[];
+extern struct page *vdsox32_pages[];
+static unsigned vdsox32_size;
+
+static void __init patch_vdsox32(void *vdso, size_t len)
+{
+	Elf32_Ehdr *hdr = vdso;
+	Elf32_Shdr *sechdrs, *alt_sec = 0;
+	char *secstrings;
+	void *alt_data;
+	int i;
+
+	BUG_ON(len < sizeof(Elf32_Ehdr));
+	BUG_ON(memcmp(hdr->e_ident, ELFMAG, SELFMAG) != 0);
+
+	sechdrs = (void *)hdr + hdr->e_shoff;
+	secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+
+	for (i = 1; i < hdr->e_shnum; i++) {
+		Elf32_Shdr *shdr = &sechdrs[i];
+		if (!strcmp(secstrings + shdr->sh_name, ".altinstructions")) {
+			alt_sec = shdr;
+			goto found;
+		}
+	}
+
+	/* If we get here, it's probably a bug. */
+	pr_warning("patch_vdsox32: .altinstructions not found\n");
+	return;  /* nothing to patch */
+
+found:
+	alt_data = (void *)hdr + alt_sec->sh_offset;
+	apply_alternatives(alt_data, alt_data + alt_sec->sh_size);
+}
+#endif
+
+static void __init patch_vdso64(void *vdso, size_t len)
+{
+	Elf64_Ehdr *hdr = vdso;
+	Elf64_Shdr *sechdrs, *alt_sec = 0;
+	char *secstrings;
+	void *alt_data;
+	int i;
+
+	BUG_ON(len < sizeof(Elf64_Ehdr));
+	BUG_ON(memcmp(hdr->e_ident, ELFMAG, SELFMAG) != 0);
+
+	sechdrs = (void *)hdr + hdr->e_shoff;
+	secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+
+	for (i = 1; i < hdr->e_shnum; i++) {
+		Elf64_Shdr *shdr = &sechdrs[i];
+		if (!strcmp(secstrings + shdr->sh_name, ".altinstructions")) {
+			alt_sec = shdr;
+			goto found;
+		}
+	}
+
+	/* If we get here, it's probably a bug. */
+	pr_warning("patch_vdso64: .altinstructions not found\n");
+	return;  /* nothing to patch */
+
+found:
+	alt_data = (void *)hdr + alt_sec->sh_offset;
+	apply_alternatives(alt_data, alt_data + alt_sec->sh_size);
+}
+
+static int __init init_vdso(void)
+{
+	int npages = (vdso_end - vdso_start + PAGE_SIZE - 1) / PAGE_SIZE;
+	int i;
+
+	patch_vdso64(vdso_start, vdso_end - vdso_start);
+
+	vdso_size = npages << PAGE_SHIFT;
+	for (i = 0; i < npages; i++)
+		vdso_pages[i] = virt_to_page(vdso_start + i*PAGE_SIZE);
+
+#ifdef CONFIG_X86_X32_ABI
+	patch_vdsox32(vdsox32_start, vdsox32_end - vdsox32_start);
+	npages = (vdsox32_end - vdsox32_start + PAGE_SIZE - 1) / PAGE_SIZE;
+	vdsox32_size = npages << PAGE_SHIFT;
+	for (i = 0; i < npages; i++)
+		vdsox32_pages[i] = virt_to_page(vdsox32_start + i*PAGE_SIZE);
+#endif
+
+	init_uts_ns.vdso.addr		= vdso_start;
+	init_uts_ns.vdso.pages		= vdso_pages;
+	init_uts_ns.vdso.nr_pages	= npages;
+	init_uts_ns.vdso.size		= vdso_size;
+	init_uts_ns.vdso.version_off	= (unsigned long)VDSO64_SYMBOL(0, linux_version_code);
+
+	return 0;
+}
+subsys_initcall(init_vdso);
+
+struct linux_binprm;
+
+/* Put the vdso above the (randomized) stack with another randomized offset.
+   This way there is no hole in the middle of address space.
+   To save memory make sure it is still in the same PTE as the stack top.
+   This doesn't give that many random bits */
+static unsigned long vdso_addr(unsigned long start, unsigned len)
+{
+	unsigned long addr, end;
+	unsigned offset;
+	end = (start + PMD_SIZE - 1) & PMD_MASK;
+	if (end >= TASK_SIZE_MAX)
+		end = TASK_SIZE_MAX;
+	end -= len;
+	/* This loses some more bits than a modulo, but is cheaper */
+	offset = get_random_int() & (PTRS_PER_PTE - 1);
+	addr = start + (offset << PAGE_SHIFT);
+	if (addr >= end)
+		addr = end;
+
+	/*
+	 * page-align it here so that get_unmapped_area doesn't
+	 * align it wrongfully again to the next page. addr can come in 4K
+	 * unaligned here as a result of stack start randomization.
+	 */
+	addr = PAGE_ALIGN(addr);
+	addr = align_vdso_addr(addr);
+
+	return addr;
+}
+
+/* Setup a VMA at program startup for the vsyscall page.
+   Not called for compat tasks */
+static int setup_additional_pages(struct linux_binprm *bprm,
+				  int uses_interp,
+				  struct page **pages,
+				  unsigned size)
+{
+	struct mm_struct *mm = current->mm;
+	unsigned long addr;
+	int ret;
+
+	if (!vdso_enabled)
+		return 0;
+
+	down_write(&mm->mmap_sem);
+	addr = vdso_addr(mm->start_stack, size);
+	addr = get_unmapped_area(NULL, addr, size, 0, 0);
+	if (IS_ERR_VALUE(addr)) {
+		ret = addr;
+		goto up_fail;
+	}
+
+	current->mm->context.vdso = (void *)addr;
+
+	ret = install_special_mapping(mm, addr, size,
+				      VM_READ|VM_EXEC|
+				      VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC,
+				      pages);
+	if (ret) {
+		current->mm->context.vdso = NULL;
+		goto up_fail;
+	}
+
+up_fail:
+	up_write(&mm->mmap_sem);
+	return ret;
+}
+
+static DEFINE_MUTEX(vdso_mutex);
+
+static int uts_arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+{
+	struct uts_namespace *uts_ns = current->nsproxy->uts_ns;
+	struct ve_struct *ve = get_exec_env();
+	int i, n1, n2, n3, new_version;
+	struct page **new_pages, **p;
+
+	/*
+	 * For node or in case we've not changed UTS simply
+	 * map preallocated original vDSO.
+	 *
+	 * In turn if we already allocated one for this UTS
+	 * simply reuse it. It improves speed significantly.
+	 */
+	if (uts_ns == &init_uts_ns)
+		goto map_init_uts;
+	/*
+	 * Dirty lockless hack. Strictly speaking
+	 * we need to return @p here if it's non-nil,
+	 * but since there only one trasition possible
+	 * { =0 ; !=0 } we simply return @uts_ns->vdso.pages
+	 */
+	p = ACCESS_ONCE(uts_ns->vdso.pages);
+	smp_read_barrier_depends();
+	if (p)
+		goto map_uts;
+
+	if (sscanf(uts_ns->name.release, "%d.%d.%d", &n1, &n2, &n3) == 3) {
+		/*
+		 * If there were no changes on version simply reuse
+		 * preallocated one.
+		 */
+		new_version = KERNEL_VERSION(n1, n2, n3);
+		if (new_version == LINUX_VERSION_CODE)
+			goto map_init_uts;
+	} else {
+		/*
+		 * If admin is passed malformed string here
+		 * lets warn him once but continue working
+		 * not using vDSO virtualization at all. It's
+		 * better than walk out with error.
+		 */
+		pr_warn_once("Wrong release uts name format detected."
+			     " Ignoring vDSO virtualization.\n");
+		goto map_init_uts;
+	}
+
+	mutex_lock(&vdso_mutex);
+	if (uts_ns->vdso.pages) {
+		mutex_unlock(&vdso_mutex);
+		goto map_uts;
+	}
+
+	uts_ns->vdso.nr_pages	= init_uts_ns.vdso.nr_pages;
+	uts_ns->vdso.size	= init_uts_ns.vdso.size;
+	uts_ns->vdso.version_off= init_uts_ns.vdso.version_off;
+	new_pages		= kmalloc(sizeof(struct page *) * init_uts_ns.vdso.nr_pages, GFP_KERNEL);
+	if (!new_pages) {
+		pr_err("Can't allocate vDSO pages array for VE %d\n", ve->veid);
+		goto out_unlock;
+	}
+
+	for (i = 0; i < uts_ns->vdso.nr_pages; i++) {
+		struct page *p = alloc_page(GFP_KERNEL);
+		if (!p) {
+			pr_err("Can't allocate page for VE %d\n", ve->veid);
+			for (; i > 0; i--)
+				put_page(new_pages[i - 1]);
+			kfree(new_pages);
+			goto out_unlock;
+		}
+		new_pages[i] = p;
+		copy_page(page_address(p), page_address(init_uts_ns.vdso.pages[i]));
+	}
+
+	uts_ns->vdso.addr = vmap(new_pages, uts_ns->vdso.nr_pages, 0, PAGE_KERNEL);
+	if (!uts_ns->vdso.addr) {
+		pr_err("Can't map vDSO pages for VE %d\n", ve->veid);
+		for (i = 0; i < uts_ns->vdso.nr_pages; i++)
+			put_page(new_pages[i]);
+		kfree(new_pages);
+		goto out_unlock;
+	}
+
+	*((int *)(uts_ns->vdso.addr + uts_ns->vdso.version_off)) = new_version;
+	smp_wmb();
+	uts_ns->vdso.pages = new_pages;
+	mutex_unlock(&vdso_mutex);
+
+	pr_debug("vDSO version transition %d -> %d for VE %d\n",
+		 LINUX_VERSION_CODE, new_version, ve->veid);
+
+map_uts:
+	return setup_additional_pages(bprm, uses_interp, uts_ns->vdso.pages, uts_ns->vdso.size);
+map_init_uts:
+	return setup_additional_pages(bprm, uses_interp, init_uts_ns.vdso.pages, init_uts_ns.vdso.size);
+out_unlock:
+	mutex_unlock(&vdso_mutex);
+	return -ENOMEM;
+}
+
+int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+{
+	return uts_arch_setup_additional_pages(bprm, uses_interp);
+}
+
+#ifdef CONFIG_X86_X32_ABI
+int x32_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+{
+	return setup_additional_pages(bprm, uses_interp, vdsox32_pages,
+				      vdsox32_size);
+}
+#endif
+
+static __init int vdso_setup(char *s)
+{
+	vdso_enabled = simple_strtoul(s, NULL, 0);
+	return 0;
+}
+__setup("vdso=", vdso_setup);
